@@ -15,15 +15,17 @@ pgvector==0.2.5
 # Supabase
 supabase==2.9.1
 
-# AI / RAG
-llama-index==0.11.14
-llama-index-vector-stores-postgres==0.2.5
-llama-index-embeddings-huggingface==0.3.1
-llama-index-llms-groq==0.2.0
-sentence-transformers==3.1.1
+# AI Runtime
 groq==0.11.0
 openai==1.51.0
 pyjwt==2.9.0
+
+# Optional RAG / Ingestion dependencies (install separately when needed):
+# llama-index==0.11.14
+# llama-index-vector-stores-postgres==0.2.5
+# llama-index-embeddings-huggingface==0.3.1
+# llama-index-llms-groq==0.2.0
+# sentence-transformers==3.1.1
 
 # Task Queue
 celery[redis]==5.4.0
