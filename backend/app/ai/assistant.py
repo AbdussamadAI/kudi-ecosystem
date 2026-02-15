@@ -18,7 +18,7 @@ from typing import AsyncGenerator
 from openai import AsyncOpenAI
 
 from app.config import get_settings
-from app.ai.prompts import SYSTEM_PROMPT, DISCLAIMER, CONTEXT_TEMPLATE, USER_PROFILE_TEMPLATE
+from app.ai.prompts import SYSTEM_PROMPT, CONTEXT_TEMPLATE, USER_PROFILE_TEMPLATE
 from app.ai.tools import TOOL_DEFINITIONS, execute_tool
 
 
@@ -54,7 +54,9 @@ class TaxAssistant:
             api_key=config["api_key"],
         )
         self.model = settings.LLM_MODEL
-        self._rag_enabled = False
+        self.max_output_tokens = max(128, min(settings.ASSISTANT_MAX_OUTPUT_TOKENS, 2048))
+        self.max_output_words = max(40, settings.ASSISTANT_MAX_OUTPUT_WORDS)
+        self._rag_enabled = settings.ASSISTANT_ENABLE_RAG
 
     def enable_rag(self):
         self._rag_enabled = True
@@ -68,7 +70,12 @@ class TaxAssistant:
     ) -> list[dict]:
         messages = []
 
-        system_content = SYSTEM_PROMPT
+        system_content = (
+            SYSTEM_PROMPT
+            + f"\n\nResponse Budget:\n- Hard cap: {self.max_output_words} words\n"
+            "- Be direct and straight to the point.\n"
+            "- Only go beyond this if the user explicitly asks for detailed analysis."
+        )
 
         if user_profile:
             system_content += "\n\n" + USER_PROFILE_TEMPLATE.format(
@@ -94,6 +101,21 @@ class TaxAssistant:
         messages.append({"role": "user", "content": user_message})
 
         return messages
+
+    def _truncate_response(self, content: str) -> str:
+        words = content.split()
+        if len(words) <= self.max_output_words:
+            return content.strip()
+
+        trimmed = " ".join(words[: self.max_output_words]).strip()
+        sentence_end = max(trimmed.rfind(". "), trimmed.rfind("? "), trimmed.rfind("! "))
+        if sentence_end > int(len(trimmed) * 0.6):
+            trimmed = trimmed[: sentence_end + 1]
+
+        return (
+            f"{trimmed}\n\n"
+            "(Response truncated for brevity. Ask for more detail if needed.)"
+        )
 
     def _retrieve_rag_context(self, query: str) -> str | None:
         if not self._rag_enabled:
@@ -137,7 +159,7 @@ class TaxAssistant:
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=self.max_output_tokens,
             )
 
             choice = response.choices[0]
@@ -179,7 +201,7 @@ class TaxAssistant:
                         "content": result,
                     })
             else:
-                content = choice.message.content or ""
+                content = self._truncate_response(choice.message.content or "")
                 # Disclaimer is handled by system prompt - don't append here
                 return {
                     "response": content,
@@ -188,7 +210,10 @@ class TaxAssistant:
                     "model": self.model,
                 }
 
-        content = response.choices[0].message.content or "I apologize, but I encountered an issue processing your request. Please try again."
+        content = self._truncate_response(
+            response.choices[0].message.content
+            or "I apologize, but I encountered an issue processing your request. Please try again."
+        )
         # Disclaimer is handled by system prompt - don't append here
 
         return {
@@ -224,7 +249,7 @@ class TaxAssistant:
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=self.max_output_tokens,
             )
 
             choice = response.choices[0]
@@ -271,13 +296,24 @@ class TaxAssistant:
             model=self.model,
             messages=messages,
             temperature=0.3,
-            max_tokens=4096,
+            max_tokens=self.max_output_tokens,
             stream=True,
         )
 
+        emitted_text = ""
+        generated_text = ""
+
         async for chunk in stream:
             if chunk.choices[0].delta.content:
-                yield json.dumps({"type": "content", "text": chunk.choices[0].delta.content}) + "\n"
+                generated_text += chunk.choices[0].delta.content
+                bounded_text = self._truncate_response(generated_text)
+                if len(bounded_text) > len(emitted_text):
+                    delta_text = bounded_text[len(emitted_text):]
+                    yield json.dumps({"type": "content", "text": delta_text}) + "\n"
+                    emitted_text = bounded_text
+
+                if len(generated_text.split()) > self.max_output_words:
+                    break
 
         # Disclaimer is handled by system prompt - don't append here
         yield json.dumps({"type": "done"}) + "\n"

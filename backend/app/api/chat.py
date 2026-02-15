@@ -10,35 +10,44 @@ from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 
 from app.config import get_settings
-from app.api.auth import get_current_user, get_supabase, get_supabase_admin
-from app.schemas.schemas import ChatMessageCreate, ConversationResponse, ConversationListResponse
+from app.api.auth import get_current_user, get_supabase_admin
+from app.schemas.schemas import ChatMessageCreate, ConversationListResponse
 from app.ai.assistant import TaxAssistant
 
 router = APIRouter()
 settings = get_settings()
 assistant = TaxAssistant()
 
+def get_user_record(current_user) -> dict | None:
+    """Get the current user's row from public.users."""
+    admin_client = get_supabase_admin()
+    user_result = admin_client.table("users").select("*").eq(
+        "supabase_id", str(current_user.id)
+    ).maybe_single().execute()
+    return user_result.data if user_result and user_result.data else None
+
 
 @router.post("/send")
 async def send_message(data: ChatMessageCreate, current_user=Depends(get_current_user)):
     """Send a message to the AI Tax Assistant and get a response."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
-        user_data = supabase.table("users").select("*").eq(
-            "supabase_id", str(current_user.id)
-        ).single().execute()
+        user_data = get_user_record(current_user)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+        user_uuid = user_data["id"]
 
         user_profile = None
-        if user_data.data:
+        if user_data:
             profile_data = supabase.table("user_profiles").select("*").eq(
-                "user_id", str(current_user.id)
+                "user_id", user_uuid
             ).maybe_single().execute()
 
             user_profile = {
-                "name": user_data.data.get("full_name", "User"),
-                "user_type": user_data.data.get("user_type", "individual"),
-                "tier": user_data.data.get("subscription_tier", "free"),
+                "name": user_data.get("full_name", "User"),
+                "user_type": user_data.get("user_type", "individual"),
+                "tier": user_data.get("subscription_tier", "free"),
                 "state": profile_data.data.get("state_of_residence", "Not specified") if profile_data.data else "Not specified",
                 "additional_context": "",
             }
@@ -47,6 +56,12 @@ async def send_message(data: ChatMessageCreate, current_user=Depends(get_current
         conversation_history = []
 
         if conversation_id:
+            conversation = supabase.table("chat_conversations").select("id").eq(
+                "id", str(conversation_id)
+            ).eq("user_id", user_uuid).maybe_single().execute()
+            if not conversation or not conversation.data:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
             messages_result = supabase.table("chat_messages").select("*").eq(
                 "conversation_id", str(conversation_id)
             ).order("created_at").execute()
@@ -57,7 +72,7 @@ async def send_message(data: ChatMessageCreate, current_user=Depends(get_current
             ]
         else:
             conv_result = supabase.table("chat_conversations").insert({
-                "user_id": str(current_user.id),
+                "user_id": user_uuid,
                 "title": data.message[:50] + ("..." if len(data.message) > 50 else ""),
             }).execute()
 
@@ -101,24 +116,18 @@ async def send_message(data: ChatMessageCreate, current_user=Depends(get_current
 @router.post("/stream")
 async def stream_message(data: ChatMessageCreate, current_user=Depends(get_current_user)):
     """Stream a response from the AI Tax Assistant via Server-Sent Events."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
-        # Try to get user data with admin client (bypasses RLS)
-        admin_client = get_supabase_admin()
-        try:
-            user_data = admin_client.table("users").select("*").eq(
-                "supabase_id", str(current_user.id)
-            ).maybe_single().execute()
-        except Exception:
-            user_data = None
+        user_data = get_user_record(current_user)
+        user_uuid = user_data["id"] if user_data else None
 
         user_profile = None
-        if user_data and user_data.data:
+        if user_data:
             user_profile = {
-                "name": user_data.data.get("full_name", "User"),
-                "user_type": user_data.data.get("user_type", "individual"),
-                "tier": user_data.data.get("subscription_tier", "free"),
+                "name": user_data.get("full_name", "User"),
+                "user_type": user_data.get("user_type", "individual"),
+                "tier": user_data.get("subscription_tier", "free"),
                 "state": "Not specified",
                 "additional_context": "",
             }
@@ -136,6 +145,13 @@ async def stream_message(data: ChatMessageCreate, current_user=Depends(get_curre
         conversation_history = []
 
         if conversation_id:
+            if user_uuid:
+                conversation = supabase.table("chat_conversations").select("id").eq(
+                    "id", str(conversation_id)
+                ).eq("user_id", user_uuid).maybe_single().execute()
+                if not conversation or not conversation.data:
+                    raise HTTPException(status_code=404, detail="Conversation not found")
+
             messages_result = supabase.table("chat_messages").select("*").eq(
                 "conversation_id", str(conversation_id)
             ).order("created_at").execute()
@@ -147,12 +163,6 @@ async def stream_message(data: ChatMessageCreate, current_user=Depends(get_curre
         else:
             # Try to create conversation, but continue even if DB fails
             try:
-                user_lookup = supabase.table("users").select("id").eq(
-                    "supabase_id", str(current_user.id)
-                ).maybe_single().execute()
-                
-                user_uuid = user_lookup.data["id"] if user_lookup and user_lookup.data else None
-                
                 if user_uuid:
                     conv_result = supabase.table("chat_conversations").insert({
                         "user_id": user_uuid,
@@ -205,6 +215,8 @@ async def stream_message(data: ChatMessageCreate, current_user=Depends(get_curre
             },
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stream failed: {str(e)}")
 
@@ -212,17 +224,23 @@ async def stream_message(data: ChatMessageCreate, current_user=Depends(get_curre
 @router.get("/conversations", response_model=ConversationListResponse)
 async def list_conversations(current_user=Depends(get_current_user)):
     """List all conversations for the current user."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
+        user_data = get_user_record(current_user)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
         result = supabase.table("chat_conversations").select("*", count="exact").eq(
-            "user_id", str(current_user.id)
+            "user_id", user_data["id"]
         ).order("created_at", desc=True).execute()
 
         return ConversationListResponse(
             conversations=result.data or [],
             total=result.count or 0,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to list conversations: {str(e)}")
 
@@ -230,12 +248,16 @@ async def list_conversations(current_user=Depends(get_current_user)):
 @router.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: UUID, current_user=Depends(get_current_user)):
     """Get a conversation with all its messages."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
+        user_data = get_user_record(current_user)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
         conv_result = supabase.table("chat_conversations").select("*").eq(
             "id", str(conversation_id)
-        ).eq("user_id", str(current_user.id)).single().execute()
+        ).eq("user_id", user_data["id"]).single().execute()
 
         if not conv_result.data:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -257,17 +279,29 @@ async def get_conversation(conversation_id: UUID, current_user=Depends(get_curre
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: UUID, current_user=Depends(get_current_user)):
     """Delete a conversation and all its messages."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
+        user_data = get_user_record(current_user)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        conv_result = supabase.table("chat_conversations").select("id").eq(
+            "id", str(conversation_id)
+        ).eq("user_id", user_data["id"]).maybe_single().execute()
+        if not conv_result or not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
         supabase.table("chat_messages").delete().eq(
             "conversation_id", str(conversation_id)
         ).execute()
 
         supabase.table("chat_conversations").delete().eq(
             "id", str(conversation_id)
-        ).eq("user_id", str(current_user.id)).execute()
+        ).eq("user_id", user_data["id"]).execute()
 
         return {"message": "Conversation deleted successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to delete conversation: {str(e)}")

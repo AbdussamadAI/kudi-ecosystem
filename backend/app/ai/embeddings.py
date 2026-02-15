@@ -26,7 +26,7 @@ CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBED_DIMENSION = 384
-TABLE_NAME = "tax_law_embeddings"
+TABLE_NAME = "document_embeddings"
 
 
 def get_embed_model() -> HuggingFaceEmbedding:

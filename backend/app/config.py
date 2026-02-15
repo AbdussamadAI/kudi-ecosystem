@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "openrouter"  # "groq" or "openrouter"
     LLM_MODEL: str = "meta-llama/llama-3.1-70b-instruct"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    ASSISTANT_ENABLE_RAG: bool = False
+    ASSISTANT_MAX_OUTPUT_TOKENS: int = 600
+    ASSISTANT_MAX_OUTPUT_WORDS: int = 180
 
     # Payments
     PAYSTACK_SECRET_KEY: str = ""

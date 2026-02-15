@@ -3,11 +3,13 @@ Billing API routes.
 Handles freemium subscription management via Paystack (NGN) and Stripe (international).
 """
 
+from uuid import UUID
+
 from fastapi import APIRouter, HTTPException, Depends, Request
 
 from app.config import get_settings
-from app.api.auth import get_current_user, get_supabase
-from app.schemas.schemas import SubscriptionCreateRequest, SubscriptionResponse
+from app.api.auth import get_current_user, get_supabase_admin
+from app.schemas.schemas import SubscriptionCreateRequest
 
 router = APIRouter()
 settings = get_settings()
@@ -26,6 +28,21 @@ PLAN_CODES = {
         "amount_usd": 15,
     },
 }
+
+
+def is_valid_uuid(value: str) -> bool:
+    try:
+        UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def get_user_record_by_supabase_id(supabase, supabase_id: str) -> dict | None:
+    user_data = supabase.table("users").select("*").eq(
+        "supabase_id", supabase_id
+    ).maybe_single().execute()
+    return user_data.data if user_data and user_data.data else None
 
 
 @router.get("/plans")
@@ -89,7 +106,9 @@ async def create_subscription(data: SubscriptionCreateRequest, current_user=Depe
     if not plan_info:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {data.plan.value}")
 
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
+    user_record = get_user_record_by_supabase_id(supabase, str(current_user.id))
+    user_uuid = user_record["id"] if user_record else None
 
     if data.provider == "paystack":
         try:
@@ -106,7 +125,8 @@ async def create_subscription(data: SubscriptionCreateRequest, current_user=Depe
                     "amount": plan_info["amount_ngn"] * 100,
                     "plan": plan_info["paystack"],
                     "metadata": {
-                        "user_id": str(current_user.id),
+                        "supabase_id": str(current_user.id),
+                        "user_id": user_uuid,
                         "plan": data.plan.value,
                     },
                 },
@@ -143,7 +163,8 @@ async def create_subscription(data: SubscriptionCreateRequest, current_user=Depe
                 success_url="https://kudwise.com/billing/success?session_id={CHECKOUT_SESSION_ID}",
                 cancel_url="https://kudwise.com/billing/cancel",
                 metadata={
-                    "user_id": str(current_user.id),
+                    "supabase_id": str(current_user.id),
+                    "user_id": user_uuid,
                     "plan": data.plan.value,
                 },
             )
@@ -182,18 +203,28 @@ async def paystack_webhook(request: Request):
     payload = await request.json()
     event = payload.get("event")
 
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     if event == "subscription.create":
         data = payload.get("data", {})
         metadata = data.get("metadata", {})
         user_id = metadata.get("user_id")
+        supabase_id = metadata.get("supabase_id")
         plan = metadata.get("plan", "pro")
+
+        # Backward compatibility: older payloads may put Supabase ID in user_id.
+        if user_id and not is_valid_uuid(user_id) and not supabase_id:
+            supabase_id = user_id
+            user_id = None
+
+        if not user_id and supabase_id:
+            user_record = get_user_record_by_supabase_id(supabase, supabase_id)
+            user_id = user_record["id"] if user_record else None
 
         if user_id:
             supabase.table("users").update({
                 "subscription_tier": plan,
-            }).eq("supabase_id", user_id).execute()
+            }).eq("id", user_id).execute()
 
             supabase.table("subscriptions").upsert({
                 "user_id": user_id,
@@ -219,19 +250,19 @@ async def paystack_webhook(request: Request):
 @router.get("/subscription")
 async def get_subscription(current_user=Depends(get_current_user)):
     """Get current user's subscription status."""
-    supabase = get_supabase()
+    supabase = get_supabase_admin()
 
     try:
-        user_data = supabase.table("users").select("subscription_tier").eq(
-            "supabase_id", str(current_user.id)
-        ).single().execute()
+        user_record = get_user_record_by_supabase_id(supabase, str(current_user.id))
+        if not user_record:
+            return {"tier": "free", "subscription": None}
 
         sub_data = supabase.table("subscriptions").select("*").eq(
-            "user_id", str(current_user.id)
+            "user_id", user_record["id"]
         ).maybe_single().execute()
 
         return {
-            "tier": user_data.data.get("subscription_tier", "free") if user_data.data else "free",
+            "tier": user_record.get("subscription_tier", "free"),
             "subscription": sub_data.data if sub_data.data else None,
         }
     except Exception as e:
